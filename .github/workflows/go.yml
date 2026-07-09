@@ -31,3 +31,23 @@ jobs:
 
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.1
+
+  test:
+    runs-on: ubuntu-latest
+    name: Test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: true
+
+      - name: Test
+        run: go test -race ./...
+
+      # The owner label is opt-in, so its code path is skipped by the default run.
+      - name: Test with owner label enabled
+        run: METRICS_OWNER_LABEL=true go test -race -count=1 ./...

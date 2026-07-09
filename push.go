@@ -45,6 +45,12 @@ import (
 var fcmPackageName = os.Getenv("FCM_PACKAGE_NAME")
 var fcmClient *messaging.Client
 
+// sendFCM is the seam the push handler goes through to reach Firebase, so that the
+// handler can be exercised without live credentials.
+var sendFCM = func(ctx context.Context, msg *messaging.Message) (string, error) {
+	return fcmClient.Send(ctx, msg)
+}
+
 func init() {
 	if _, hasPort := os.LookupEnv("PORT"); !hasPort {
 		exerrors.PanicIfNotNil(os.Setenv("PORT", "8080"))
@@ -71,24 +77,31 @@ func main() {
 	}).Compile())
 	exzerolog.SetupDefaults(log)
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /_gomuks/push/fcm", handlePushProxy)
-	mux.HandleFunc("GET /{$}", handleIndex)
+	mux.HandleFunc("POST /_gomuks/push/fcm", instrumentHandler("push", handlePushProxy))
+	mux.HandleFunc("GET /{$}", instrumentHandler("index", handleIndex))
 	server := http.Server{
 		Addr: fmt.Sprintf("%s:%s", os.Getenv("HOST"), os.Getenv("PORT")),
 		Handler: exhttp.ApplyMiddleware(
 			mux,
 			hlog.NewHandler(*log),
+			// Correlates the access log line (source IP, user agent) with the
+			// FCM result line (owner, push token) for the same request.
+			hlog.RequestIDHandler("request_id", "X-Request-ID"),
 			requestlog.AccessLogger(requestlog.Options{TrustXForwardedFor: true}),
 		),
 	}
 	ctx := log.WithContext(context.Background())
 	app := exerrors.Must(firebase.NewApp(ctx, nil, option.WithCredentialsFile(os.Getenv("FCM_CREDENTIALS_FILE"))))
 	fcmClient = exerrors.Must(app.Messaging(ctx))
+	metricsServer := serveMetrics(log)
 	go func() {
 		c := make(chan os.Signal, 1)
 		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 		<-c
 		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if metricsServer != nil {
+			_ = metricsServer.Shutdown(ctx)
+		}
 		exerrors.PanicIfNotNil(server.Shutdown(ctx))
 		cancel()
 	}()
@@ -140,16 +153,28 @@ const maxContentLength = 4096
 func handlePushProxy(w http.ResponseWriter, r *http.Request) {
 	var req PushRequest
 	if r.URL.Path != "/_gomuks/push/fcm" {
-		w.WriteHeader(http.StatusNotFound)
+		rejectPush(w, rejectNotFound, http.StatusNotFound)
+		return
 	} else if r.ContentLength > maxContentLength {
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		rejectPush(w, rejectContentTooLarge, http.StatusRequestEntityTooLarge)
+		return
 	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(http.StatusBadRequest)
+		rejectPush(w, rejectInvalidJSON, http.StatusBadRequest)
+		return
 	} else if base64.StdEncoding.EncodedLen(len(req.Payload)) > maxPayloadLength {
-		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		rejectPush(w, rejectPayloadTooLarge, http.StatusRequestEntityTooLarge)
+		return
 	} else if len(req.Owner) == 0 || len(req.Owner) > 255 {
-		w.WriteHeader(http.StatusBadRequest)
-	} else if resp, err := fcmClient.Send(r.Context(), req.ToFCM()); err != nil {
+		rejectPush(w, rejectInvalidOwner, http.StatusBadRequest)
+		return
+	}
+
+	pushPayloadBytes.Observe(float64(len(req.Payload)))
+	start := time.Now()
+	resp, err := sendFCM(r.Context(), req.ToFCM())
+	duration := time.Since(start)
+
+	if err != nil {
 		hlog.FromRequest(r).
 			Err(err).
 			Str("push_token", req.Token).
@@ -157,17 +182,21 @@ func handlePushProxy(w http.ResponseWriter, r *http.Request) {
 			Msg("Failed to send FCM request")
 		// TODO can errors be checked properly?
 		if err.Error() == "Requested entity was not found." || err.Error() == "SenderId mismatch" {
+			recordPush(req.Owner, req.GetPriority(), resultInvalidToken, duration)
 			w.WriteHeader(http.StatusNotFound)
 		} else {
+			recordPush(req.Owner, req.GetPriority(), resultError, duration)
 			w.WriteHeader(http.StatusInternalServerError)
 		}
-	} else {
-		hlog.FromRequest(r).
-			Err(err).
-			Str("push_token", req.Token).
-			Str("message_id", resp).
-			Str("owner", req.Owner).
-			Msg("Sent FCM request")
-		w.WriteHeader(http.StatusOK)
+		return
 	}
+
+	hlog.FromRequest(r).
+		Info().
+		Str("push_token", req.Token).
+		Str("message_id", resp).
+		Str("owner", req.Owner).
+		Msg("Sent FCM request")
+	recordPush(req.Owner, req.GetPriority(), resultSent, duration)
+	w.WriteHeader(http.StatusOK)
 }
