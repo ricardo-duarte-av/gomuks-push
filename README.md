@@ -13,6 +13,7 @@ the android app and using your own FCM credentials.
 | `PORT` | `8080` | Listen port for the push endpoint. |
 | `FCM_CREDENTIALS_FILE` | — | Path to the Firebase service account JSON. |
 | `FCM_PACKAGE_NAME` | — | Android package name FCM messages are restricted to. |
+| `FCM_PACKAGE_NAME_WHITELIST` | — | Comma-separated package names clients may request via `app_id`. |
 | `METRICS_LISTEN_ADDRESS` | `:9090` | Listen address for the Prometheus endpoint. Set to `-` to disable. |
 | `METRICS_OWNER_LABEL` | `false` | Add an `owner` label to push metrics. See the warning below. |
 
@@ -24,8 +25,8 @@ is published. Keep that port on your internal network.
 
 | Metric | Type | Labels |
 | --- | --- | --- |
-| `gomuks_push_pushes_total` | counter | `result` (`sent`, `invalid_token`, `error`), `priority` (`high`, `normal`) |
-| `gomuks_push_pushes_rejected_total` | counter | `reason` (`invalid_json`, `invalid_owner`, `payload_too_large`, `content_too_large`, `not_found`) |
+| `gomuks_push_pushes_total` | counter | `result` (`sent`, `invalid_token`, `quota_exceeded`, `invalid_argument`, `error`), `priority` (`high`, `normal`) |
+| `gomuks_push_pushes_rejected_total` | counter | `reason` (`invalid_json`, `invalid_owner`, `invalid_target`, `app_id_not_allowed`, `payload_too_large`, `content_too_large`, `not_found`) |
 | `gomuks_push_fcm_send_duration_seconds` | histogram | `result` |
 | `gomuks_push_push_payload_bytes` | histogram | — |
 | `gomuks_push_http_requests_total` | counter | `handler`, `method`, `code` |
@@ -47,8 +48,8 @@ They are recorded in the structured logs instead, not in metrics:
   IP or per token means Prometheus memory grows without limit as clients come and go.
 
 The access log already records `remote_addr`, `x_forwarded_for` and `user_agent`, and the
-FCM result lines record `owner`, `push_token` and `message_id`. Both carry a `request_id`,
-so a single request can be reconstructed across the two lines. Query them with Loki or
+FCM result lines record `owner`, `push_token`, `installation_id`, `app_id` and `message_id`.
+Both carry a `request_id`, so a single request can be reconstructed across the two lines. Query them with Loki or
 `jq` against `/var/log/gomuks-push.log` when you need per-identity detail.
 
 `METRICS_OWNER_LABEL=true` adds an `owner` (Matrix user ID) label to
