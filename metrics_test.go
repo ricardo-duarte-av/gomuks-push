@@ -2,15 +2,16 @@ package main
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
+	firebase "firebase.google.com/go/v4"
 	"firebase.google.com/go/v4/messaging"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"google.golang.org/api/option"
 )
 
 // stubFCM replaces the Firebase seam for the duration of a test.
@@ -19,6 +20,41 @@ func stubFCM(t *testing.T, id string, err error) {
 	original := sendFCM
 	sendFCM = func(context.Context, *messaging.Message) (string, error) { return id, err }
 	t.Cleanup(func() { sendFCM = original })
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// fakeFCM points the Firebase seam at a real messaging client whose transport
+// answers every request with the given FCM v1 response. The messaging.Is* helpers
+// only recognise errors the SDK itself parsed, so outcomes can't be stubbed directly.
+func fakeFCM(t *testing.T, status int, body string) {
+	t.Helper()
+	httpClient := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(body)),
+			Request:    r,
+		}, nil
+	})}
+	ctx := context.Background()
+	app, err := firebase.NewApp(ctx, &firebase.Config{ProjectID: "test"}, option.WithHTTPClient(httpClient))
+	if err != nil {
+		t.Fatalf("firebase app: %v", err)
+	}
+	client, err := app.Messaging(ctx)
+	if err != nil {
+		t.Fatalf("messaging client: %v", err)
+	}
+	original := sendFCM
+	sendFCM = client.Send
+	t.Cleanup(func() { sendFCM = original })
+}
+
+func fcmError(status, errorCode string) string {
+	return `{"error":{"status":"` + status + `","message":"test","details":[{"@type":"type.googleapis.com/google.firebase.fcm.v1.FcmError","errorCode":"` + errorCode + `"}]}}`
 }
 
 func post(t *testing.T, body string, contentLength int64) *httptest.ResponseRecorder {
@@ -60,7 +96,10 @@ func TestRejectionsAreRecorded(t *testing.T) {
 	}{
 		{"invalid json", "not json", 0, http.StatusBadRequest, rejectInvalidJSON},
 		{"empty owner", `{"owner":"","token":"t"}`, 0, http.StatusBadRequest, rejectInvalidOwner},
-		{"content too large", `{"owner":"@a:b"}`, maxContentLength + 1, http.StatusRequestEntityTooLarge, rejectContentTooLarge},
+		{"no token or fid", `{"owner":"@a:b"}`, 0, http.StatusBadRequest, rejectInvalidTarget},
+		{"both token and fid", `{"owner":"@a:b","token":"t","fid":"f"}`, 0, http.StatusBadRequest, rejectInvalidTarget},
+		{"app id not whitelisted", `{"owner":"@a:b","token":"t","app_id":"com.example.evil"}`, 0, http.StatusForbidden, rejectAppIDNotAllowed},
+		{"content too large", `{"owner":"@a:b"}`, maxRequestLength + 1, http.StatusRequestEntityTooLarge, rejectContentTooLarge},
 		{"payload too large", `{"owner":"@a:b","payload":"` + strings.Repeat("A", 4004) + `"}`, 0, http.StatusRequestEntityTooLarge, rejectPayloadTooLarge},
 	}
 	for _, tc := range cases {
@@ -81,18 +120,21 @@ func TestRejectionsAreRecorded(t *testing.T) {
 func TestPushOutcomesAreRecorded(t *testing.T) {
 	cases := []struct {
 		name       string
-		err        error
+		status     int
+		body       string
 		wantStatus int
 		wantResult string
 	}{
-		{"success", nil, http.StatusOK, resultSent},
-		{"unregistered token", errors.New("Requested entity was not found."), http.StatusNotFound, resultInvalidToken},
-		{"sender mismatch", errors.New("SenderId mismatch"), http.StatusNotFound, resultInvalidToken},
-		{"upstream failure", errors.New("boom"), http.StatusInternalServerError, resultError},
+		{"success", http.StatusOK, `{"name":"projects/test/messages/msg-id"}`, http.StatusOK, resultSent},
+		{"unregistered token", http.StatusNotFound, fcmError("NOT_FOUND", "UNREGISTERED"), http.StatusNotFound, resultInvalidToken},
+		{"sender mismatch", http.StatusForbidden, fcmError("PERMISSION_DENIED", "SENDER_ID_MISMATCH"), http.StatusNotFound, resultInvalidToken},
+		{"quota exceeded", http.StatusTooManyRequests, fcmError("RESOURCE_EXHAUSTED", "QUOTA_EXCEEDED"), http.StatusTooManyRequests, resultQuotaExceeded},
+		{"invalid argument", http.StatusBadRequest, fcmError("INVALID_ARGUMENT", "INVALID_ARGUMENT"), http.StatusBadRequest, resultInvalidArgument},
+		{"upstream failure", http.StatusInternalServerError, fcmError("INTERNAL", "INTERNAL"), http.StatusInternalServerError, resultError},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			stubFCM(t, "msg-id", tc.err)
+			fakeFCM(t, tc.status, tc.body)
 			counter := pushesTotal.WithLabelValues(tc.wantResult, "high")
 			before := testutil.ToFloat64(counter)
 

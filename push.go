@@ -1,5 +1,5 @@
 // gomuks/push - An FCM push gateway for gomuks android.
-// Copyright (C) 2024 Tulir Asokan
+// Copyright (C) 2024-2026 Tulir Asokan
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU Affero General Public License as published by
@@ -17,15 +17,19 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -35,6 +39,7 @@ import (
 	"github.com/rs/zerolog/hlog"
 	"go.mau.fi/util/exerrors"
 	"go.mau.fi/util/exhttp"
+	"go.mau.fi/util/exmaps"
 	"go.mau.fi/util/exzerolog"
 	"go.mau.fi/util/ptr"
 	"go.mau.fi/util/requestlog"
@@ -43,18 +48,13 @@ import (
 )
 
 var fcmPackageName = os.Getenv("FCM_PACKAGE_NAME")
+var fcmPackageNameWhitelist = exmaps.NewSetWithItems(strings.Split(os.Getenv("FCM_PACKAGE_NAME_WHITELIST"), ","))
 var fcmClient *messaging.Client
 
 // sendFCM is the seam the push handler goes through to reach Firebase, so that the
 // handler can be exercised without live credentials.
 var sendFCM = func(ctx context.Context, msg *messaging.Message) (string, error) {
 	return fcmClient.Send(ctx, msg)
-}
-
-func init() {
-	if _, hasPort := os.LookupEnv("PORT"); !hasPort {
-		exerrors.PanicIfNotNil(os.Setenv("PORT", "8080"))
-	}
 }
 
 func main() {
@@ -68,7 +68,7 @@ func main() {
 			Format: zeroconfig.LogFormatJSON,
 			FileConfig: zeroconfig.FileConfig{
 				Filename:   "/var/log/gomuks-push.log",
-				MaxSize:    100 * 1024,
+				MaxSize:    100,
 				MaxAge:     7,
 				MaxBackups: 10,
 			},
@@ -80,7 +80,7 @@ func main() {
 	mux.HandleFunc("POST /_gomuks/push/fcm", instrumentHandler("push", handlePushProxy))
 	mux.HandleFunc("GET /{$}", instrumentHandler("index", handleIndex))
 	server := http.Server{
-		Addr: fmt.Sprintf("%s:%s", os.Getenv("HOST"), os.Getenv("PORT")),
+		Addr: fmt.Sprintf("%s:%s", os.Getenv("HOST"), cmp.Or(os.Getenv("PORT"), "8080")),
 		Handler: exhttp.ApplyMiddleware(
 			mux,
 			hlog.NewHandler(*log),
@@ -89,9 +89,12 @@ func main() {
 			hlog.RequestIDHandler("request_id", "X-Request-ID"),
 			requestlog.AccessLogger(requestlog.Options{TrustXForwardedFor: true}),
 		),
+		Protocols: &http.Protocols{},
 	}
+	server.Protocols.SetHTTP1(true)
+	server.Protocols.SetUnencryptedHTTP2(true)
 	ctx := log.WithContext(context.Background())
-	app := exerrors.Must(firebase.NewApp(ctx, nil, option.WithCredentialsFile(os.Getenv("FCM_CREDENTIALS_FILE"))))
+	app := exerrors.Must(firebase.NewApp(ctx, nil, option.WithAuthCredentialsFile(option.ServiceAccount, os.Getenv("FCM_CREDENTIALS_FILE"))))
 	fcmClient = exerrors.Must(app.Messaging(ctx))
 	metricsServer := serveMetrics(log)
 	go func() {
@@ -122,22 +125,33 @@ func handleIndex(w http.ResponseWriter, r *http.Request) {
 
 type PushRequest struct {
 	Token        string `json:"token"`
+	Fid          string `json:"fid"`
 	Owner        string `json:"owner"`
 	Payload      []byte `json:"payload"`
 	HighPriority bool   `json:"high_priority"`
+	AppID        string `json:"app_id,omitempty"`
 }
 
-func (pr *PushRequest) ToFCM() *messaging.Message {
+func (pr *PushRequest) ToFCM() (*messaging.Message, int) {
+	appID := fcmPackageName
+	if pr.AppID != "" {
+		if !fcmPackageNameWhitelist.Has(pr.AppID) {
+			return nil, http.StatusForbidden
+		}
+		appID = pr.AppID
+	}
 	return &messaging.Message{
 		Data: map[string]string{
 			"payload": base64.StdEncoding.EncodeToString(pr.Payload),
 		},
 		Android: &messaging.AndroidConfig{
-			RestrictedPackageName: fcmPackageName,
+			RestrictedPackageName: appID,
 			Priority:              pr.GetPriority(),
 		},
+		//lint:ignore SA1019 push tokens are still in use
 		Token: pr.Token,
-	}
+		Fid:   pr.Fid,
+	}, 0
 }
 
 func (pr *PushRequest) GetPriority() string {
@@ -148,17 +162,17 @@ func (pr *PushRequest) GetPriority() string {
 }
 
 const maxPayloadLength = 4000
-const maxContentLength = 4096
+const maxRequestLength = 5 * 1024
 
 func handlePushProxy(w http.ResponseWriter, r *http.Request) {
 	var req PushRequest
 	if r.URL.Path != "/_gomuks/push/fcm" {
 		rejectPush(w, rejectNotFound, http.StatusNotFound)
 		return
-	} else if r.ContentLength > maxContentLength {
+	} else if r.ContentLength > maxRequestLength {
 		rejectPush(w, rejectContentTooLarge, http.StatusRequestEntityTooLarge)
 		return
-	} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	} else if err := json.NewDecoder(io.LimitReader(r.Body, maxRequestLength)).Decode(&req); err != nil {
 		rejectPush(w, rejectInvalidJSON, http.StatusBadRequest)
 		return
 	} else if base64.StdEncoding.EncodedLen(len(req.Payload)) > maxPayloadLength {
@@ -167,23 +181,38 @@ func handlePushProxy(w http.ResponseWriter, r *http.Request) {
 	} else if len(req.Owner) == 0 || len(req.Owner) > 255 {
 		rejectPush(w, rejectInvalidOwner, http.StatusBadRequest)
 		return
+	} else if len(req.Token) > 200 || len(req.Fid) > 200 ||
+		(req.Fid != "" && req.Token != "") || (req.Fid == "" && req.Token == "") {
+		rejectPush(w, rejectInvalidTarget, http.StatusBadRequest)
+		return
+	}
+	payload, stat := req.ToFCM()
+	if stat != 0 {
+		rejectPush(w, rejectAppIDNotAllowed, stat)
+		return
 	}
 
 	pushPayloadBytes.Observe(float64(len(req.Payload)))
 	start := time.Now()
-	resp, err := sendFCM(r.Context(), req.ToFCM())
+	resp, err := sendFCM(r.Context(), payload)
 	duration := time.Since(start)
 
 	if err != nil {
 		hlog.FromRequest(r).
 			Err(err).
 			Str("push_token", req.Token).
+			Str("installation_id", req.Fid).
 			Str("owner", req.Owner).
 			Msg("Failed to send FCM request")
-		// TODO can errors be checked properly?
-		if err.Error() == "Requested entity was not found." || err.Error() == "SenderId mismatch" {
+		if messaging.IsSenderIDMismatch(err) || messaging.IsUnregistered(err) {
 			recordPush(req.Owner, req.GetPriority(), resultInvalidToken, duration)
 			w.WriteHeader(http.StatusNotFound)
+		} else if messaging.IsQuotaExceeded(err) {
+			recordPush(req.Owner, req.GetPriority(), resultQuotaExceeded, duration)
+			w.WriteHeader(http.StatusTooManyRequests)
+		} else if messaging.IsInvalidArgument(err) {
+			recordPush(req.Owner, req.GetPriority(), resultInvalidArgument, duration)
+			w.WriteHeader(http.StatusBadRequest)
 		} else {
 			recordPush(req.Owner, req.GetPriority(), resultError, duration)
 			w.WriteHeader(http.StatusInternalServerError)
@@ -194,9 +223,13 @@ func handlePushProxy(w http.ResponseWriter, r *http.Request) {
 	hlog.FromRequest(r).
 		Info().
 		Str("push_token", req.Token).
+		Str("installation_id", req.Fid).
 		Str("message_id", resp).
+		Str("app_id", payload.Android.RestrictedPackageName).
 		Str("owner", req.Owner).
 		Msg("Sent FCM request")
 	recordPush(req.Owner, req.GetPriority(), resultSent, duration)
+	w.Header().Set("Content-Length", strconv.Itoa(len(resp)))
 	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(resp))
 }

@@ -44,9 +44,11 @@ var ownerLabelEnabled = os.Getenv("METRICS_OWNER_LABEL") == "true"
 
 // Outcomes of a push that reached FCM.
 const (
-	resultSent         = "sent"
-	resultInvalidToken = "invalid_token"
-	resultError        = "error"
+	resultSent            = "sent"
+	resultInvalidToken    = "invalid_token"
+	resultQuotaExceeded   = "quota_exceeded"
+	resultInvalidArgument = "invalid_argument"
+	resultError           = "error"
 )
 
 // Reasons a push was rejected before it reached FCM.
@@ -56,6 +58,8 @@ const (
 	rejectInvalidJSON     = "invalid_json"
 	rejectPayloadTooLarge = "payload_too_large"
 	rejectInvalidOwner    = "invalid_owner"
+	rejectInvalidTarget   = "invalid_target"
+	rejectAppIDNotAllowed = "app_id_not_allowed"
 )
 
 var registry = prometheus.NewRegistry()
@@ -143,13 +147,13 @@ func init() {
 	// Pre-create the series that alerting relies on so that a rate() over a
 	// freshly started process does not silently return no data.
 	for _, priority := range []string{"high", "normal"} {
-		for _, result := range []string{resultSent, resultInvalidToken, resultError} {
+		for _, result := range []string{resultSent, resultInvalidToken, resultQuotaExceeded, resultInvalidArgument, resultError} {
 			pushesTotal.WithLabelValues(result, priority)
 		}
 	}
 	for _, reason := range []string{
 		rejectNotFound, rejectContentTooLarge, rejectInvalidJSON,
-		rejectPayloadTooLarge, rejectInvalidOwner,
+		rejectPayloadTooLarge, rejectInvalidOwner, rejectInvalidTarget, rejectAppIDNotAllowed,
 	} {
 		pushesRejectedTotal.WithLabelValues(reason)
 	}
